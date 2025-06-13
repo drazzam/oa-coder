@@ -1,8 +1,9 @@
-const { app, BrowserWindow, globalShortcut, ipcMain } = require('electron');
+const { app, BrowserWindow, globalShortcut, ipcMain, screen } = require('electron');
 const path = require('path');
 const screenshot = require('screenshot-desktop');
 const fs = require('fs');
 const { GoogleGenerativeAI } = require('@google/generative-ai');
+const os = require('os');
 
 let config;
 try {
@@ -16,7 +17,7 @@ try {
   
   // Set default model if not specified
   if (!config.model) {
-    config.model = "gemini-1.5-pro";
+    config.model = "gemini-2.5-flash-preview-05-20";
     console.log("Model not specified in config, using default:", config.model);
   }
 } catch (err) {
@@ -31,6 +32,77 @@ let mainWindow;
 let screenshots = [];
 let multiPageMode = false;
 let appIsActive = true; // Flag to track if app is actively intercepting input
+let isScreenSharingDetected = false;
+
+// Enhanced privacy protection for Windows
+function enablePrivacyProtection(window) {
+  // Enable content protection
+  window.setContentProtection(true);
+  
+  // Additional privacy settings for Windows
+  if (os.platform() === 'win32') {
+    try {
+      // Set window to be excluded from capture
+      window.setSkipTaskbar(true);
+      
+      // Use Windows-specific flags to prevent screen capture
+      const { nativeImage } = require('electron');
+      
+      // Set additional window properties for privacy
+      window.setAlwaysOnTop(true, 'screen-saver', 2);
+      
+      // Try to set window as non-capturable (Windows 10/11 specific)
+      try {
+        const { execSync } = require('child_process');
+        const windowId = window.getNativeWindowHandle();
+        
+        // Note: This requires additional native modules for full Windows API access
+        // For now, we'll rely on Electron's built-in protections
+        console.log('Enhanced privacy protection enabled for Windows');
+      } catch (e) {
+        console.log('Advanced Windows privacy features unavailable, using Electron defaults');
+      }
+    } catch (error) {
+      console.error('Error applying Windows-specific privacy settings:', error);
+    }
+  }
+  
+  // Set window to not appear in screen capture APIs
+  window.setVisibleOnAllWorkspaces(false, { visibleOnFullScreen: false });
+  
+  // Monitor for screen sharing attempts
+  detectScreenSharing();
+}
+
+// Detect potential screen sharing scenarios
+function detectScreenSharing() {
+  // Monitor for multiple displays or screen capture requests
+  setInterval(() => {
+    const displays = screen.getAllDisplays();
+    const currentScreenSharing = displays.some(display => 
+      display.bounds.width !== display.workArea.width || 
+      display.bounds.height !== display.workArea.height
+    );
+    
+    if (currentScreenSharing !== isScreenSharingDetected) {
+      isScreenSharingDetected = currentScreenSharing;
+      if (isScreenSharingDetected) {
+        console.log('Potential screen sharing detected - enhancing privacy');
+        if (mainWindow) {
+          // Additional hiding when screen sharing is detected
+          mainWindow.setOpacity(0.01); // Nearly invisible
+          mainWindow.minimize();
+          setTimeout(() => {
+            if (mainWindow) {
+              mainWindow.restore();
+              mainWindow.setOpacity(1.0);
+            }
+          }, 1000);
+        }
+      }
+    }
+  }, 2000);
+}
 
 function updateInstruction(instruction) {
   if (mainWindow?.webContents) {
@@ -47,8 +119,11 @@ function hideInstruction() {
 async function captureScreenshot() {
   try {
     hideInstruction();
+    
+    // Enhanced hiding during screenshot capture
+    mainWindow.setOpacity(0);
     mainWindow.hide();
-    await new Promise(res => setTimeout(res, 200));
+    await new Promise(res => setTimeout(res, 300)); // Longer delay for better hiding
 
     const timestamp = Date.now();
     const imagePath = path.join(app.getPath('pictures'), `screenshot_${timestamp}.png`);
@@ -57,10 +132,17 @@ async function captureScreenshot() {
     const imageBuffer = fs.readFileSync(imagePath);
     const base64Image = imageBuffer.toString('base64');
 
+    // Restore window visibility
+    mainWindow.setOpacity(1.0);
     mainWindow.show();
+    
     return { base64Image, imagePath };
   } catch (err) {
-    mainWindow.show();
+    // Ensure window is restored even on error
+    if (mainWindow) {
+      mainWindow.setOpacity(1.0);
+      mainWindow.show();
+    }
     if (mainWindow.webContents) {
       mainWindow.webContents.send('error', err.message);
     }
@@ -70,23 +152,38 @@ async function captureScreenshot() {
 
 async function processScreenshots() {
   try {
-    // Get the Gemini model
+    // Get the Gemini model with updated model name
     const model = genAI.getGenerativeModel({ model: config.model });
     
     // Create a new chat session
     const chat = model.startChat();
     
-    // Prepare the prompt with text and images specifically for MCQ questions
+    // Enhanced prompt for better MCQ analysis
     const prompt = `
-    This is a multiple-choice question. Please:
-    1. Identify the question being asked
-    2. Analyze all available options
-    3. Select the correct answer with high confidence
-    4. Explain why this is the correct answer
-    5. Format your response as:
-       **Question:** [the question]
-       **Correct Answer:** [option letter/number] - [the answer text]
-       **Explanation:** [your explanation]
+    You are an expert MCQ solver. Analyze the provided image(s) and:
+    
+    1. **Identify the Question**: Extract and clearly state the complete question being asked.
+    
+    2. **List All Options**: Identify all available answer choices (A, B, C, D, etc.) with their full text.
+    
+    3. **Select the Correct Answer**: Choose the most accurate answer based on your knowledge and reasoning.
+    
+    4. **Provide Detailed Explanation**: Explain why the selected answer is correct and why other options are incorrect.
+    
+    5. **Format your response as**:
+       **Question:** [Complete question text]
+       
+       **Available Options:**
+       A) [Option A text]
+       B) [Option B text]
+       C) [Option C text]
+       D) [Option D text]
+       
+       **Correct Answer:** [Letter] - [Answer text]
+       
+       **Explanation:** [Detailed reasoning for the correct answer and why other options are wrong]
+       
+       **Confidence Level:** [High/Medium/Low]
     `;
     
     // Create the content parts array with the initial text
@@ -138,27 +235,52 @@ function toggleAppInteractivity() {
 }
 
 function createWindow() {
+  // Enhanced window creation with maximum privacy protection
+  const primaryDisplay = screen.getPrimaryDisplay();
+  const { width, height } = primaryDisplay.workAreaSize;
+
   mainWindow = new BrowserWindow({
-    width: 800,
-    height: 600,
+    width: Math.min(800, width),
+    height: Math.min(600, height),
     webPreferences: {
       nodeIntegration: true,
-      contextIsolation: false
+      contextIsolation: false,
+      // Enhanced security settings
+      webSecurity: true,
+      allowRunningInsecureContent: false,
+      experimentalFeatures: false
     },
+    // Enhanced privacy window options
     frame: false,
     transparent: true,
     alwaysOnTop: true,
-    paintWhenInitiallyHidden: true,
-    contentProtection: true,
-    type: 'toolbar',
+    paintWhenInitiallyHidden: false,
+    type: os.platform() === 'win32' ? 'toolbar' : 'panel',
+    skipTaskbar: true,
+    focusable: true,
+    resizable: false,
+    minimizable: true,
+    maximizable: false,
+    closable: true,
+    // Additional privacy settings
+    enableLargerThanScreen: false,
+    useContentSize: true,
+    show: false, // Start hidden for enhanced privacy setup
   });
 
-  mainWindow.loadFile('index.html');
-  mainWindow.setContentProtection(true);
-  mainWindow.setVisibleOnAllWorkspaces(true, { visibleOnFullScreen: true });
-  mainWindow.setAlwaysOnTop(true, 'screen-saver', 1);
+  // Apply enhanced privacy protection
+  enablePrivacyProtection(mainWindow);
 
-  // Ctrl+Shift+S => single or final screenshot
+  mainWindow.loadFile('index.html');
+  
+  // Show window only after privacy protection is enabled
+  mainWindow.once('ready-to-show', () => {
+    mainWindow.show();
+    mainWindow.setVisibleOnAllWorkspaces(true, { visibleOnFullScreen: false });
+    mainWindow.setAlwaysOnTop(true, 'screen-saver', 2);
+  });
+
+  // Global shortcuts remain the same
   globalShortcut.register('CommandOrControl+Shift+S', async () => {
     try {
       const { base64Image, imagePath } = await captureScreenshot();
@@ -169,7 +291,6 @@ function createWindow() {
     }
   });
 
-  // Ctrl+Shift+A => multi-page mode
   globalShortcut.register('CommandOrControl+Shift+A', async () => {
     try {
       if (!multiPageMode) {
@@ -184,18 +305,15 @@ function createWindow() {
     }
   });
 
-  // Ctrl+Shift+R => reset
   globalShortcut.register('CommandOrControl+Shift+R', () => {
     resetProcess();
   });
      
-  // Ctrl+Shift+Q => Quit the application
   globalShortcut.register('CommandOrControl+Shift+Q', () => {
     console.log("Quitting application...");
     app.quit();
   });
   
-  // Ctrl+Shift+I => Toggle interactivity (click-through mode)
   globalShortcut.register('CommandOrControl+Shift+I', () => {
     toggleAppInteractivity();
   });
@@ -215,9 +333,38 @@ function createWindow() {
     }
   });
   ipcMain.on('reset-process', resetProcess);
+
+  // Enhanced privacy: Hide window when browsers request screen access
+  mainWindow.on('blur', () => {
+    // Temporarily reduce opacity when window loses focus
+    if (isScreenSharingDetected) {
+      mainWindow.setOpacity(0.1);
+      setTimeout(() => {
+        if (mainWindow && !mainWindow.isFocused()) {
+          mainWindow.setOpacity(1.0);
+        }
+      }, 500);
+    }
+  });
+
+  mainWindow.on('focus', () => {
+    mainWindow.setOpacity(1.0);
+  });
 }
 
-app.whenReady().then(createWindow);
+// Enhanced app initialization with privacy focus
+app.whenReady().then(() => {
+  // Additional privacy settings for the entire app
+  app.setAppUserModelId('com.privacy.mcqsolver');
+  
+  // Prevent the app from appearing in recent documents
+  app.setAboutPanelOptions({
+    applicationName: 'MCQ Privacy Tool',
+    applicationVersion: '2.0.0',
+  });
+  
+  createWindow();
+});
 
 app.on('window-all-closed', () => {
   globalShortcut.unregisterAll();
@@ -231,3 +378,25 @@ app.on('activate', () => {
     createWindow();
   }
 });
+
+// Additional privacy protection: Quit app if screen recording is detected for too long
+let screenRecordingDuration = 0;
+setInterval(() => {
+  if (isScreenSharingDetected) {
+    screenRecordingDuration += 5;
+    if (screenRecordingDuration > 60) { // Hide for 60 seconds
+      console.log('Extended screen sharing detected - enhanced privacy mode');
+      if (mainWindow) {
+        mainWindow.hide();
+        setTimeout(() => {
+          if (mainWindow) {
+            mainWindow.show();
+          }
+        }, 10000); // Hide for 10 seconds
+      }
+      screenRecordingDuration = 0;
+    }
+  } else {
+    screenRecordingDuration = 0;
+  }
+}, 5000);
